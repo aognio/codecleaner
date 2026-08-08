@@ -43,6 +43,8 @@ without cleaning anything.
 Use --clean-by-census to interactively delete census entries.
 Use --clean-reclaimable to delete items classified as reclaimable by the
 extended statistics engine.
+Use --sanitize-for TARGET to remove artifacts incompatible with a target
+platform or expected to be regenerated there.
 Add --exclude-preserved to --stats or --census to skip remembered preserved
 directories from the inspection scan.
 """
@@ -52,7 +54,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import shutil
+import struct
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -81,6 +85,33 @@ CONFIG_PATH = Path.home() / ".config" / "codecleaner" / "config.toml"
 CENSUS_LIMIT = 50
 GIT_STATS_LIMIT = 20
 RECLAIMABLE_EXPLAIN_LIMIT = 50
+SANITIZATION_EXPLAIN_LIMIT = 50
+
+
+SUPPORTED_TARGETS = {
+    "linux-amd64",
+    "linux-arm64",
+    "macos-amd64",
+    "macos-arm64",
+}
+
+
+OS_ALIASES = {
+    "darwin": "macos",
+    "mac": "macos",
+    "macos": "macos",
+    "osx": "macos",
+    "linux": "linux",
+}
+
+
+ARCH_ALIASES = {
+    "x86_64": "amd64",
+    "x64": "amd64",
+    "amd64": "amd64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+}
 
 
 # Reproducible dependency/cache/build directories.
@@ -255,7 +286,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Clean reproducible dependencies, caches, build artifacts, "
-            "and macOS Mach-O binaries from a development tree."
+            "native artifacts, and target-specific state from a development "
+            "tree."
         )
     )
 
@@ -329,8 +361,8 @@ def parse_args() -> argparse.Namespace:
         "--all",
         action="store_true",
         help=(
-            "With --stats --extended --explain-reclaimable, show every "
-            "reclaimable item instead of the largest bounded set."
+            "With explanation output, show every item instead of the largest "
+            "bounded set."
         ),
     )
 
@@ -368,6 +400,27 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--sanitize-for",
+        metavar="TARGET",
+        help=(
+            "Sanitize the tree for TARGET platform. Supported targets include "
+            "linux-amd64, linux-arm64, macos-amd64, macos-arm64, and native."
+        ),
+    )
+
+    parser.add_argument(
+        "--sanitize",
+        action="store_true",
+        help="Shortcut for --sanitize-for native.",
+    )
+
+    parser.add_argument(
+        "--explain-sanitization",
+        action="store_true",
+        help="With --sanitize-for, list the filesystem objects in the plan.",
+    )
+
+    parser.add_argument(
         "--interactive",
         action="store_true",
         help="Prompt before each cleanup action where supported.",
@@ -398,13 +451,20 @@ def parse_args() -> argparse.Namespace:
         args.census,
         args.clean_by_census,
         args.clean_reclaimable,
+        bool(args.sanitize_for or args.sanitize),
     ])
 
     if action_modes > 1:
         parser.error(
-            "--stats, --census, --clean-by-census, and --clean-reclaimable "
-            "cannot be combined"
+            "--stats, --census, --clean-by-census, --clean-reclaimable, "
+            "and --sanitize-for cannot be combined"
         )
+
+    if args.sanitize and args.sanitize_for:
+        parser.error("--sanitize cannot be combined with --sanitize-for")
+
+    if args.sanitize:
+        args.sanitize_for = "native"
 
     if args.exclude_preserved and not (args.stats or args.census):
         parser.error("--exclude-preserved requires --stats or --census")
@@ -412,8 +472,11 @@ def parse_args() -> argparse.Namespace:
     if args.include_preserved and not args.clean_by_census:
         parser.error("--include-preserved requires --clean-by-census")
 
-    if args.interactive and not args.clean_reclaimable:
-        parser.error("--interactive is currently supported with --clean-reclaimable")
+    if args.interactive and not (args.clean_reclaimable or args.sanitize_for):
+        parser.error(
+            "--interactive is currently supported with --clean-reclaimable "
+            "or --sanitize-for"
+        )
 
     if args.extended and not args.stats:
         parser.error("--extended requires --stats")
@@ -421,8 +484,11 @@ def parse_args() -> argparse.Namespace:
     if args.explain_reclaimable and not (args.stats and args.extended):
         parser.error("--explain-reclaimable requires --stats --extended")
 
-    if args.all and not args.explain_reclaimable:
-        parser.error("--all requires --explain-reclaimable")
+    if args.explain_sanitization and not args.sanitize_for:
+        parser.error("--explain-sanitization requires --sanitize-for")
+
+    if args.all and not (args.explain_reclaimable or args.explain_sanitization):
+        parser.error("--all requires --explain-reclaimable or --explain-sanitization")
 
     if args.stats and (args.remember or args.dry_run):
         parser.error("--stats cannot be combined with other switches")
@@ -439,6 +505,7 @@ def parse_args() -> argparse.Namespace:
         or args.exclude_preserved
         or args.extended
         or args.explain_reclaimable
+        or args.explain_sanitization
         or args.all
         or args.interactive
     ):
@@ -449,10 +516,25 @@ def parse_args() -> argparse.Namespace:
         or args.exclude_preserved
         or args.extended
         or args.explain_reclaimable
+        or args.explain_sanitization
         or args.all
         or args.include_preserved
+        or args.sanitize_for
     ):
         parser.error("--clean-reclaimable cannot be combined with other switches")
+
+    if args.sanitize_for and (
+        args.remember
+        or args.exclude_preserved
+        or args.include_preserved
+        or args.extended
+        or args.explain_reclaimable
+        or args.stats
+        or args.census
+        or args.clean_by_census
+        or args.clean_reclaimable
+    ):
+        parser.error("--sanitize-for cannot be combined with other action modes")
 
     return args
 
@@ -789,6 +871,206 @@ def load_explicit_preserved_paths(
 # File identification
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class PlatformId:
+    os: str
+    arch: str
+
+    def __str__(self) -> str:
+        return f"{self.os}-{self.arch}"
+
+
+@dataclass(frozen=True)
+class NativeArtifact:
+    path: Path
+    format: str
+    os: str
+    architectures: frozenset[str]
+
+    @property
+    def platforms(self) -> set[PlatformId]:
+        return {
+            PlatformId(self.os, architecture)
+            for architecture in self.architectures
+        }
+
+    @property
+    def description(self) -> str:
+        architectures = "/".join(sorted(self.architectures)) or "unknown"
+        return f"{self.format} {architectures}"
+
+
+def normalize_os(value: str) -> str | None:
+    return OS_ALIASES.get(value.strip().lower())
+
+
+def normalize_arch(value: str) -> str | None:
+    return ARCH_ALIASES.get(value.strip().lower())
+
+
+def normalize_platform_identifier(value: str) -> PlatformId:
+    raw = value.strip().lower()
+
+    if raw == "native":
+        return detect_native_platform()
+
+    if "-" not in raw:
+        raise ValueError(
+            "target must be native or an OS-ARCH value such as linux-amd64"
+        )
+
+    os_value, arch_value = raw.split("-", 1)
+    normalized_os = normalize_os(os_value)
+    normalized_arch = normalize_arch(arch_value)
+
+    if normalized_os is None or normalized_arch is None:
+        raise ValueError(f"unsupported target platform: {value}")
+
+    platform_id = PlatformId(normalized_os, normalized_arch)
+
+    if str(platform_id) not in SUPPORTED_TARGETS:
+        raise ValueError(f"unsupported target platform: {value}")
+
+    return platform_id
+
+
+def detect_native_platform() -> PlatformId:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    normalized_os = normalize_os(system)
+    normalized_arch = normalize_arch(machine)
+
+    if normalized_os is None or normalized_arch is None:
+        raise ValueError(f"unsupported native platform: {system}-{machine}")
+
+    platform_id = PlatformId(normalized_os, normalized_arch)
+
+    if str(platform_id) not in SUPPORTED_TARGETS:
+        raise ValueError(f"unsupported native platform: {platform_id}")
+
+    return platform_id
+
+
+def macho_arch_name(cputype: int) -> str | None:
+    if cputype == 0x01000007:
+        return "amd64"
+
+    if cputype == 0x0100000C:
+        return "arm64"
+
+    return None
+
+
+def parse_macho_artifact(path: Path, data: bytes) -> NativeArtifact | None:
+    magic = data[:4]
+
+    if len(data) < 8:
+        return NativeArtifact(path, "Mach-O", "macos", frozenset())
+
+    if magic in {
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+    }:
+        endian = ">"
+        cputype = struct.unpack_from(">I", data, 4)[0]
+        architecture = macho_arch_name(cputype)
+        architectures = frozenset([architecture]) if architecture else frozenset()
+        return NativeArtifact(path, "Mach-O", "macos", architectures)
+
+    if magic in {
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+    }:
+        cputype = struct.unpack_from("<I", data, 4)[0]
+        architecture = macho_arch_name(cputype)
+        architectures = frozenset([architecture]) if architecture else frozenset()
+        return NativeArtifact(path, "Mach-O", "macos", architectures)
+
+    if magic in {
+        b"\xca\xfe\xba\xbe",
+        b"\xca\xfe\xba\xbf",
+        b"\xbe\xba\xfe\xca",
+        b"\xbf\xba\xfe\xca",
+    }:
+        endian = ">" if magic in {b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"} else "<"
+        entry_size = 32 if magic in {b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"} else 20
+        nfat_arch = struct.unpack_from(f"{endian}I", data, 4)[0]
+        architectures: set[str] = set()
+
+        for index in range(nfat_arch):
+            offset = 8 + (index * entry_size)
+
+            if len(data) < offset + 4:
+                break
+
+            cputype = struct.unpack_from(f"{endian}I", data, offset)[0]
+            architecture = macho_arch_name(cputype)
+
+            if architecture is not None:
+                architectures.add(architecture)
+
+        return NativeArtifact(path, "Mach-O", "macos", frozenset(architectures))
+
+    return None
+
+
+def elf_arch_name(machine: int) -> str | None:
+    if machine == 62:
+        return "amd64"
+
+    if machine == 183:
+        return "arm64"
+
+    return None
+
+
+def parse_elf_artifact(path: Path, data: bytes) -> NativeArtifact | None:
+    if len(data) < 20 or data[:4] != b"\x7fELF":
+        return None
+
+    data_encoding = data[5]
+
+    if data_encoding == 1:
+        endian = "<"
+    elif data_encoding == 2:
+        endian = ">"
+    else:
+        return NativeArtifact(path, "ELF", "linux", frozenset())
+
+    machine = struct.unpack_from(f"{endian}H", data, 18)[0]
+    architecture = elf_arch_name(machine)
+    architectures = frozenset([architecture]) if architecture else frozenset()
+    return NativeArtifact(path, "ELF", "linux", architectures)
+
+
+def inspect_native_artifact(path: Path) -> NativeArtifact | None:
+    """
+    Identify native binary formats by headers.
+
+    This deliberately does NOT use executable permission bits, so executable
+    shell/Python/JavaScript scripts remain ordinary source-like files.
+    """
+    if path.is_symlink():
+        return None
+
+    try:
+        if not path.is_file():
+            return None
+
+        with path.open("rb") as handle:
+            data = handle.read(4096)
+
+    except (OSError, PermissionError):
+        return None
+
+    if data[:4] in MACHO_MAGICS:
+        return parse_macho_artifact(path, data)
+
+    if data[:4] == b"\x7fELF":
+        return parse_elf_artifact(path, data)
+
+    return None
+
 def is_macho_file(path: Path) -> bool:
     """
     Identify a Mach-O or universal/fat Mach-O file by its magic bytes.
@@ -804,20 +1086,8 @@ def is_macho_file(path: Path) -> bool:
 
     remain untouched even when chmod +x.
     """
-    if path.is_symlink():
-        return False
-
-    try:
-        if not path.is_file():
-            return False
-
-        with path.open("rb") as handle:
-            magic = handle.read(4)
-
-    except (OSError, PermissionError):
-        return False
-
-    return magic in MACHO_MAGICS
+    artifact = inspect_native_artifact(path)
+    return artifact is not None and artifact.format == "Mach-O"
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1314,19 @@ class ReclaimableItem:
 
 
 @dataclass
+class SanitizationItem:
+    decision: str
+    label: str
+    path: Path
+    size: int
+    kind: str
+    rule: str
+    reason: str
+    target: PlatformId
+    artifact: NativeArtifact | None = None
+
+
+@dataclass
 class CleanupSummary:
     candidates: int = 0
     removed: int = 0
@@ -1076,6 +1359,8 @@ class ExtendedStats:
     git_dirs: list[tuple[int, Path]] = field(default_factory=list)
     explicit_preserved_dirs: list[tuple[int, Path]] = field(default_factory=list)
     reclaimable_items: list[ReclaimableItem] = field(default_factory=list)
+    sanitization_items: list[SanitizationItem] = field(default_factory=list)
+    compatible_native: dict[str, SizeCount] = field(default_factory=dict)
 
 
 def compact_preserved(paths: list[Path]) -> list[Path]:
@@ -1132,6 +1417,54 @@ def add_removable_category(
     )
 
 
+def sanitization_decision_for_removable_section(section: str) -> str:
+    if section in {"dependencies", "build_artifacts"}:
+        return "regenerate"
+
+    return "cache"
+
+
+def sanitization_reason_for_removable(
+    section: str,
+    label: str,
+) -> str:
+    if section == "dependencies":
+        return f"{label} dependency environment should be regenerated for target"
+
+    if section == "build_artifacts":
+        return f"{label} build output should be regenerated for target"
+
+    return f"{label} cache is disposable for target migration"
+
+
+def add_sanitization_item(
+    stats: ExtendedStats,
+    *,
+    decision: str,
+    label: str,
+    path: Path,
+    size: int,
+    kind: str,
+    rule: str,
+    reason: str,
+    target: PlatformId,
+    artifact: NativeArtifact | None = None,
+) -> None:
+    stats.sanitization_items.append(
+        SanitizationItem(
+            decision=decision,
+            label=label,
+            path=path,
+            size=size,
+            kind=kind,
+            rule=rule,
+            reason=reason,
+            target=target,
+            artifact=artifact,
+        )
+    )
+
+
 def relative_display_path(path: Path, root: Path) -> Path:
     try:
         return path.relative_to(root)
@@ -1144,6 +1477,7 @@ def collect_extended_stats(
     explicit_preserved: list[Path],
     excluded_preserved: list[Path],
     verbose: bool = False,
+    sanitization_target: PlatformId | None = None,
 ) -> ExtendedStats:
     """
     Collect cleanup-aligned disk usage categories without deleting anything.
@@ -1152,6 +1486,7 @@ def collect_extended_stats(
         dependencies=defaultdict(SizeCount),
         build_artifacts=defaultdict(SizeCount),
         caches=defaultdict(SizeCount),
+        compatible_native=defaultdict(SizeCount),
     )
     explicit_preserved = compact_preserved(explicit_preserved)
     excluded_preserved = compact_preserved([
@@ -1230,6 +1565,20 @@ def collect_extended_stats(
                     "directory",
                     f'removable directory "{path.name}"',
                 )
+
+                if sanitization_target is not None:
+                    decision = sanitization_decision_for_removable_section(section)
+                    add_sanitization_item(
+                        stats,
+                        decision=decision,
+                        label=label,
+                        path=path,
+                        size=size,
+                        kind="directory",
+                        rule=f'removable directory "{path.name}"',
+                        reason=sanitization_reason_for_removable(section, label),
+                        target=sanitization_target,
+                    )
                 continue
 
             surviving_dirs.append(dirname)
@@ -1256,9 +1605,105 @@ def collect_extended_stats(
                     "file",
                     f'removable suffix "{path.suffix.lower()}"',
                 )
+
+                if sanitization_target is not None:
+                    add_sanitization_item(
+                        stats,
+                        decision="cache",
+                        label="Python bytecode files",
+                        path=path,
+                        size=size,
+                        kind="file",
+                        rule=f'removable suffix "{path.suffix.lower()}"',
+                        reason="Python bytecode cache is disposable for target migration",
+                        target=sanitization_target,
+                    )
                 continue
 
-            if is_macho_file(path):
+            artifact = (
+                inspect_native_artifact(path)
+                if sanitization_target is not None
+                else None
+            )
+
+            if artifact is not None and artifact.format == "Mach-O":
+                verbose_log(verbose, f"recognized Mach-O file {path}")
+                stats.macho_size += size
+                stats.macho_count += 1
+                stats.reclaimable_size += size
+                stats.reclaimable_items.append(
+                    ReclaimableItem(
+                        section="native_macos",
+                        label="Mach-O files",
+                        path=path,
+                        size=size,
+                        kind="file",
+                        rule="Mach-O magic bytes",
+                    )
+                )
+
+                if sanitization_target in artifact.platforms:
+                    add_category(
+                        stats.compatible_native,
+                        artifact.description,
+                        size,
+                    )
+                    stats.other_retained_size += size
+                else:
+                    add_sanitization_item(
+                        stats,
+                        decision="incompatible",
+                        label=artifact.description,
+                        path=path,
+                        size=size,
+                        kind="file",
+                        rule="native artifact platform mismatch",
+                        reason=(
+                            f"{artifact.description} is not compatible with "
+                            f"{sanitization_target}"
+                        ),
+                        target=sanitization_target,
+                        artifact=artifact,
+                    )
+                continue
+
+            if artifact is not None:
+                if sanitization_target in artifact.platforms:
+                    verbose_log(
+                        verbose,
+                        f"recognized compatible native file {path}: "
+                        f"{artifact.description}",
+                    )
+                    add_category(
+                        stats.compatible_native,
+                        artifact.description,
+                        size,
+                    )
+                    stats.other_retained_size += size
+                else:
+                    verbose_log(
+                        verbose,
+                        f"recognized incompatible native file {path}: "
+                        f"{artifact.description}",
+                    )
+                    add_sanitization_item(
+                        stats,
+                        decision="incompatible",
+                        label=artifact.description,
+                        path=path,
+                        size=size,
+                        kind="file",
+                        rule="native artifact platform mismatch",
+                        reason=(
+                            f"{artifact.description} is not compatible with "
+                            f"{sanitization_target}"
+                        ),
+                        target=sanitization_target,
+                        artifact=artifact,
+                    )
+                continue
+
+            if sanitization_target is None and is_macho_file(path):
                 verbose_log(verbose, f"recognized Mach-O file {path}")
                 stats.macho_size += size
                 stats.macho_count += 1
@@ -1921,6 +2366,416 @@ def print_reclaimable_cleanup_summary(
     print()
 
 
+SANITIZATION_DECISION_TITLES = {
+    "incompatible": "INCOMPATIBLE",
+    "regenerate": "REGENERATE",
+    "cache": "CACHE",
+}
+
+
+SANITIZATION_DECISION_ORDER = [
+    "incompatible",
+    "regenerate",
+    "cache",
+]
+
+
+def collect_sanitization_items(stats: ExtendedStats) -> list[SanitizationItem]:
+    return list(stats.sanitization_items)
+
+
+def materialize_sanitization_items(
+    items: list[SanitizationItem],
+    *,
+    verbose: bool = False,
+) -> list[SanitizationItem]:
+    materialized = list(items)
+    verbose_log(verbose, "sanitization candidates materialized")
+    sorted_items = sorted(
+        materialized,
+        key=lambda item: (item.size, str(item.path)),
+        reverse=True,
+    )
+    verbose_log(verbose, "sanitization candidates sorted by size descending")
+    return sorted_items
+
+
+def sanitization_plan_size(items: list[SanitizationItem]) -> int:
+    return sum(item.size for item in items)
+
+
+def sanitization_counts_by_decision(
+    items: list[SanitizationItem],
+) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+
+    for item in items:
+        counts[item.decision] += 1
+
+    return counts
+
+
+def print_sanitization_header(
+    *,
+    root: Path,
+    host: PlatformId,
+    target: PlatformId,
+    target_source: str,
+) -> None:
+    print()
+    print("=" * 78)
+    print("TARGET SANITIZATION")
+    print("=" * 78)
+    print()
+    print(f"Root:                {root}")
+    print(f"Host platform:       {host}")
+    print(f"Target platform:     {target}")
+    print(f"Target source:       {target_source}")
+
+
+def print_sanitization_plan(
+    *,
+    root: Path,
+    stats: ExtendedStats,
+    host: PlatformId,
+    target: PlatformId,
+    dry_run: bool,
+) -> None:
+    items = collect_sanitization_items(stats)
+    removable_size = sanitization_plan_size(items)
+    estimated_retained = max(stats.scanned_size - removable_size, 0)
+
+    print()
+    print("=" * 78)
+    print("SANITIZATION PLAN")
+    print("=" * 78)
+    print()
+    print(f"Host:                {host}")
+    print(f"Target:              {target}")
+
+    for decision in SANITIZATION_DECISION_ORDER:
+        decision_items = [
+            item
+            for item in items
+            if item.decision == decision
+        ]
+
+        if not decision_items:
+            continue
+
+        print()
+        print(SANITIZATION_DECISION_TITLES[decision])
+
+        grouped: dict[str, SizeCount] = defaultdict(SizeCount)
+
+        for item in decision_items:
+            grouped[item.label].add(item.size)
+
+        noun = "files" if decision == "incompatible" else "items"
+
+        for label, value in sorted(
+            grouped.items(),
+            key=lambda entry: (entry[1].size, entry[0]),
+            reverse=True,
+        ):
+            print(
+                f"  {label:<24} "
+                f"{format_size(value.size):>10} "
+                f"{value.count:6} {noun}"
+            )
+
+    if stats.compatible_native:
+        print()
+        print("COMPATIBLE NATIVE")
+
+        for label, value in sorted(
+            stats.compatible_native.items(),
+            key=lambda entry: (entry[1].size, entry[0]),
+            reverse=True,
+        ):
+            print(
+                f"  {label:<24} "
+                f"{format_size(value.size):>10} "
+                f"{value.count:6} files"
+            )
+
+    print()
+    print(f"Total removable:     {format_size(removable_size):>10}")
+    print(f"Estimated retained:  {format_size(estimated_retained):>10}")
+
+    if dry_run:
+        print()
+        print("DRY RUN: nothing was modified.")
+
+    print()
+
+
+def print_sanitization_items(
+    root: Path,
+    items: list[SanitizationItem],
+    *,
+    show_all: bool,
+) -> None:
+    items = materialize_sanitization_items(items)
+    displayed = items if show_all else items[:SANITIZATION_EXPLAIN_LIMIT]
+
+    print()
+    print("SANITIZATION ITEMS")
+    print()
+
+    if not items:
+        print("  (none)")
+        return
+
+    if not show_all and len(items) > len(displayed):
+        print(
+            f"Showing {len(displayed)} of {len(items)} sanitization items."
+        )
+        print("Use --all to display every item.")
+        print()
+
+    sections = SANITIZATION_DECISION_ORDER + sorted(
+        {
+            item.decision
+            for item in displayed
+            if item.decision not in SANITIZATION_DECISION_ORDER
+        }
+    )
+
+    for decision in sections:
+        section_items = [
+            item
+            for item in displayed
+            if item.decision == decision
+        ]
+
+        if not section_items:
+            continue
+
+        print(SANITIZATION_DECISION_TITLES.get(decision, decision.upper()))
+
+        for item in sorted(
+            section_items,
+            key=lambda value: (value.size, str(value.path)),
+            reverse=True,
+        ):
+            display_path = relative_display_path(item.path, root)
+            print(f"  {format_size(item.size):>10}   {display_path}")
+            print(f"               {item.reason}")
+            if item.artifact is not None:
+                print(f"               artifact {item.artifact.description}")
+            print(f"               target {item.target}")
+
+        print()
+
+
+def remove_sanitization_item(
+    item: SanitizationItem,
+    dry_run: bool,
+) -> tuple[int, bool]:
+    kind = "DIR" if item.kind == "directory" else "FILE"
+
+    report_action(
+        dry_run=dry_run,
+        kind=kind,
+        size=item.size,
+        path=item.path,
+    )
+
+    if dry_run:
+        return item.size, True
+
+    try:
+        if item.kind == "directory":
+            shutil.rmtree(item.path)
+        else:
+            item.path.unlink()
+
+        return item.size, True
+
+    except OSError as exc:
+        print(
+            f"ERROR: could not remove {item.path}: {exc}",
+            file=sys.stderr,
+        )
+        return 0, False
+
+
+def prompt_sanitization_decision(
+    *,
+    item: SanitizationItem,
+    root: Path,
+    index: int,
+    total: int,
+) -> str:
+    display_path = relative_display_path(item.path, root)
+
+    while True:
+        print(f"[{index}/{total}] {SANITIZATION_DECISION_TITLES.get(item.decision, item.decision.upper())}")
+        print()
+        print(f"Path:       {display_path}")
+        print(f"Size:       {format_size(item.size)}")
+        print(f"Reason:     {item.reason}")
+        print(f"Target:     {item.target}")
+
+        if item.artifact is not None:
+            print(f"Artifact:   {item.artifact.description}")
+
+        print(f"Action:     remove {'directory' if item.kind == 'directory' else 'file'}")
+        print()
+
+        try:
+            answer = input("Remove? [y]es / [n]o / [s]kip / [q]uit: ")
+        except EOFError:
+            return "quit"
+
+        answer = answer.strip().lower()
+
+        if answer in {"y", "yes"}:
+            return "yes"
+
+        if answer in {"n", "no"}:
+            return "no"
+
+        if answer in {"s", "skip"}:
+            return "skip"
+
+        if answer in {"q", "quit"}:
+            return "quit"
+
+        print("Please answer yes, no, skip, or quit.")
+        print()
+
+
+def execute_sanitization_cleanup(
+    *,
+    root: Path,
+    items: list[SanitizationItem],
+    interactive: bool,
+    dry_run: bool,
+    verbose: bool = False,
+) -> CleanupSummary:
+    ordered_items = materialize_sanitization_items(items, verbose=verbose)
+    summary = CleanupSummary(candidates=len(ordered_items))
+    candidate_bytes = sum(item.size for item in ordered_items)
+
+    verbose_log(verbose, f"sanitization candidates: {len(ordered_items)}")
+    verbose_log(verbose, f"sanitization bytes: {format_size(candidate_bytes)}")
+
+    if interactive:
+        print(
+            f"Found {len(ordered_items):,} sanitization items totaling "
+            f"{format_size(candidate_bytes)}."
+        )
+        print()
+        verbose_log(verbose, "starting interactive sanitization executor")
+
+    try:
+        for index, item in enumerate(ordered_items, start=1):
+            verbose_log(
+                verbose,
+                f"sanitization candidate {index}/{len(ordered_items)}: {item.path}",
+            )
+
+            if not item.path.exists() and not item.path.is_symlink():
+                summary.errors += 1
+                summary.processed += 1
+                print(
+                    f"ERROR: sanitization item no longer exists: {item.path}",
+                    file=sys.stderr,
+                )
+                continue
+
+            if interactive:
+                decision = prompt_sanitization_decision(
+                    item=item,
+                    root=root,
+                    index=index,
+                    total=len(ordered_items),
+                )
+
+                if decision == "quit":
+                    summary.stopped_early = True
+                    break
+
+                if decision == "no":
+                    summary.declined += 1
+                    summary.processed += 1
+                    continue
+
+                if decision == "skip":
+                    summary.skipped += 1
+                    summary.processed += 1
+                    continue
+
+            size, success = remove_sanitization_item(item, dry_run)
+
+            if success:
+                summary.removed += 1
+                summary.selected_size += item.size
+
+                if not dry_run:
+                    summary.reclaimed_size += size
+            else:
+                summary.errors += 1
+
+            summary.processed += 1
+
+    except KeyboardInterrupt:
+        print()
+        print("Interrupted; stopping sanitization.")
+        summary.stopped_early = True
+
+    return summary
+
+
+def print_sanitization_cleanup_summary(
+    *,
+    summary: CleanupSummary,
+    items: list[SanitizationItem],
+    host: PlatformId,
+    target: PlatformId,
+    dry_run: bool,
+) -> None:
+    counts = sanitization_counts_by_decision(items)
+
+    print()
+    print("=" * 78)
+    print("TARGET SANITIZATION SUMMARY")
+    print("=" * 78)
+    print()
+    print(f"Host:                {host}")
+    print(f"Target:              {target}")
+    print()
+    print(f"Candidates:          {summary.candidates}")
+    print(f"Incompatible:        {counts.get('incompatible', 0)}")
+    print(f"Regenerate:          {counts.get('regenerate', 0)}")
+    print(f"Caches:              {counts.get('cache', 0)}")
+    print()
+
+    if dry_run:
+        print(f"Items selected:      {summary.removed}")
+        print(f"Potential savings:   {format_size(summary.selected_size)}")
+        print(f"Reclaimed space:     {format_size(0)}")
+    else:
+        print(f"Items removed:       {summary.removed}")
+        print(f"Reclaimed space:     {format_size(summary.reclaimed_size)}")
+
+    print(f"Declined:            {summary.declined}")
+    print(f"Skipped:             {summary.skipped}")
+    print(f"Remaining/unseen:    {summary.remaining_unseen}")
+    print(f"Errors:              {summary.errors}")
+    print(f"Stopped early:       {'yes' if summary.stopped_early else 'no'}")
+    print()
+
+    if dry_run:
+        print("DRY RUN: nothing was modified.")
+    else:
+        print(f"Tree sanitized for: {target}")
+
+    print()
+
+
 def prompt_census_cleanup(entries: list[tuple[int, str, Path]]) -> tuple[int, int, int]:
     removed_items = 0
     reclaimed_size = 0
@@ -2081,6 +2936,73 @@ def main() -> int:
         print_reclaimable_cleanup_summary(
             summary,
             interactive=args.interactive,
+            dry_run=args.dry_run,
+        )
+
+        return 1 if summary.errors else 0
+
+    if args.sanitize_for:
+        try:
+            host_platform = detect_native_platform()
+            target_platform = normalize_platform_identifier(args.sanitize_for)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
+
+        target_source = "native" if args.sanitize_for == "native" else "explicit"
+
+        _remembered_values, preserved = load_cleanup_preserved_paths(
+            root,
+            args.preserve,
+        )
+
+        if preserved is None:
+            return 2
+
+        print_sanitization_header(
+            root=root,
+            host=host_platform,
+            target=target_platform,
+            target_source=target_source,
+        )
+
+        extended_stats = collect_extended_stats(
+            root,
+            preserved,
+            [],
+            verbose=args.verbose,
+            sanitization_target=target_platform,
+        )
+        verbose_log(args.verbose, "sanitization census complete")
+        sanitization_items = collect_sanitization_items(extended_stats)
+
+        print_sanitization_plan(
+            root=root,
+            stats=extended_stats,
+            host=host_platform,
+            target=target_platform,
+            dry_run=args.dry_run,
+        )
+
+        if args.explain_sanitization:
+            print_sanitization_items(
+                root,
+                sanitization_items,
+                show_all=args.all,
+            )
+
+        summary = execute_sanitization_cleanup(
+            root=root,
+            items=sanitization_items,
+            interactive=args.interactive,
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+        )
+        print_sanitization_cleanup_summary(
+            summary=summary,
+            items=sanitization_items,
+            host=host_platform,
+            target=target_platform,
             dry_run=args.dry_run,
         )
 
