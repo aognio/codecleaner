@@ -19,6 +19,46 @@ import codecleaner  # noqa: E402
 MACHO_MAGIC = b"\xfe\xed\xfa\xcf"
 
 
+def macho_thin(arch: str) -> bytes:
+    cputype = {
+        "amd64": 0x01000007,
+        "arm64": 0x0100000C,
+    }[arch]
+    return b"\xcf\xfa\xed\xfe" + cputype.to_bytes(4, "little") + b"\x00" * 64
+
+
+def macho_fat(*architectures: str) -> bytes:
+    data = bytearray(b"\xca\xfe\xba\xbe")
+    data.extend(len(architectures).to_bytes(4, "big"))
+
+    for architecture in architectures:
+        cputype = {
+            "amd64": 0x01000007,
+            "arm64": 0x0100000C,
+        }[architecture]
+        data.extend(cputype.to_bytes(4, "big"))
+        data.extend(b"\x00" * 16)
+
+    data.extend(b"\x00" * 64)
+    return bytes(data)
+
+
+def elf_file(arch: str) -> bytes:
+    machine = {
+        "amd64": 62,
+        "arm64": 183,
+    }[arch]
+    data = bytearray(b"\x7fELF")
+    data.extend(b"\x02")  # 64-bit
+    data.extend(b"\x01")  # little endian
+    data.extend(b"\x01")
+    data.extend(b"\x00" * 9)
+    data.extend((2).to_bytes(2, "little"))
+    data.extend(machine.to_bytes(2, "little"))
+    data.extend(b"\x00" * 64)
+    return bytes(data)
+
+
 def create_reclaimable_mix(root: Path) -> list[Path]:
     paths = [
         root / "project-a" / ".venv",
@@ -70,7 +110,7 @@ class CodeCleanerExtendedStatsTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "codecleaner 0.1.0")
+        self.assertEqual(result.stdout.strip(), "codecleaner 0.2.0")
 
     def test_stats_retains_concise_behavior(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -999,6 +1039,395 @@ class CodeCleanerExtendedStatsTests(unittest.TestCase):
                 "--include-preserved requires --clean-by-census",
                 result.stderr,
             )
+
+    def test_sanitization_native_platform_detection(self) -> None:
+        with patch.object(codecleaner.platform, "system", return_value="Linux"):
+            with patch.object(codecleaner.platform, "machine", return_value="x86_64"):
+                self.assertEqual(str(codecleaner.detect_native_platform()), "linux-amd64")
+
+    def test_sanitization_platform_alias_normalization(self) -> None:
+        self.assertEqual(
+            str(codecleaner.normalize_platform_identifier("darwin-aarch64")),
+            "macos-arm64",
+        )
+        self.assertEqual(
+            str(codecleaner.normalize_platform_identifier("linux-x64")),
+            "linux-amd64",
+        )
+
+    def test_sanitization_explicit_target_differs_from_host(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tool").write_bytes(macho_thin("arm64"))
+
+            with patch.object(codecleaner, "detect_native_platform", return_value=codecleaner.PlatformId("macos", "arm64")):
+                result = self.run_script(root, "--sanitize-for", "linux-amd64", "--dry-run")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Target platform:     linux-amd64", result.stdout)
+
+    def test_sanitization_macho_arm64_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool"
+            path.write_bytes(macho_thin("arm64"))
+            artifact = codecleaner.inspect_native_artifact(path)
+
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact.format, "Mach-O")
+            self.assertEqual(artifact.architectures, frozenset({"arm64"}))
+
+    def test_sanitization_macho_amd64_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool"
+            path.write_bytes(macho_thin("amd64"))
+            artifact = codecleaner.inspect_native_artifact(path)
+
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact.architectures, frozenset({"amd64"}))
+
+    def test_sanitization_fat_macho_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "universal"
+            path.write_bytes(macho_fat("amd64", "arm64"))
+            artifact = codecleaner.inspect_native_artifact(path)
+
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact.architectures, frozenset({"amd64", "arm64"}))
+
+    def test_sanitization_elf_amd64_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool"
+            path.write_bytes(elf_file("amd64"))
+            artifact = codecleaner.inspect_native_artifact(path)
+
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact.format, "ELF")
+            self.assertEqual(artifact.architectures, frozenset({"amd64"}))
+
+    def test_sanitization_elf_arm64_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool"
+            path.write_bytes(elf_file("arm64"))
+            artifact = codecleaner.inspect_native_artifact(path)
+
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact.architectures, frozenset({"arm64"}))
+
+    def test_sanitization_macho_rejected_for_linux_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "tool"
+            tool.write_bytes(macho_thin("arm64"))
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+
+            self.assertEqual({item.path for item in stats.sanitization_items}, {tool})
+            self.assertEqual(stats.sanitization_items[0].decision, "incompatible")
+
+    def test_sanitization_elf_rejected_for_macos_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "tool"
+            tool.write_bytes(elf_file("amd64"))
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("macos", "amd64"),
+            )
+
+            self.assertEqual(stats.sanitization_items[0].decision, "incompatible")
+
+    def test_sanitization_elf_amd64_retained_for_linux_amd64(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tool").write_bytes(elf_file("amd64"))
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+
+            self.assertEqual(stats.sanitization_items, [])
+            self.assertIn("ELF amd64", stats.compatible_native)
+
+    def test_sanitization_elf_arm64_rejected_for_linux_amd64(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tool").write_bytes(elf_file("arm64"))
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+
+            self.assertEqual(len(stats.sanitization_items), 1)
+            self.assertEqual(stats.sanitization_items[0].label, "ELF arm64")
+
+    def test_sanitization_executable_scripts_are_not_native(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / "deploy.sh"
+            script.write_text("#!/bin/sh\necho ok\n")
+            script.chmod(0o755)
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+
+            self.assertEqual(stats.sanitization_items, [])
+
+    def test_sanitization_venv_node_modules_and_target_regenerate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in [".venv", "node_modules", "target"]:
+                (root / name).mkdir()
+                (root / name / "payload").write_text("x")
+
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+            by_path = {item.path.name: item.decision for item in stats.sanitization_items}
+
+            self.assertEqual(by_path[".venv"], "regenerate")
+            self.assertEqual(by_path["node_modules"], "regenerate")
+            self.assertEqual(by_path["target"], "regenerate")
+
+    def test_sanitization_known_caches_are_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ["__pycache__", ".gocache", ".gomodcache", ".cache"]:
+                (root / name).mkdir()
+                (root / name / "payload").write_text("x")
+
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+
+            self.assertEqual({item.decision for item in stats.sanitization_items}, {"cache"})
+
+    def test_sanitization_source_manifests_lockfiles_retained(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ["pyproject.toml", "requirements.txt", "uv.lock", "package.json", "Cargo.lock", "go.mod"]:
+                (root / name).write_text("x")
+
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+
+            self.assertEqual(stats.sanitization_items, [])
+
+    def test_sanitization_git_is_protected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            git_tool = root / "repo" / ".git" / "tool"
+            git_tool.parent.mkdir(parents=True)
+            git_tool.write_bytes(macho_thin("arm64"))
+
+            result = self.run_script(root, "--sanitize-for", "linux-amd64")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(git_tool.exists())
+            self.assertNotIn(".git/tool", result.stdout)
+
+    def test_sanitization_preserved_trees_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            keep = root / "keep"
+            venv = keep / ".venv"
+            venv.mkdir(parents=True)
+            (venv / "payload").write_text("x")
+
+            result = self.run_script(root, "--sanitize-for", "linux-amd64", "--preserve", str(keep))
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(venv.exists())
+            self.assertNotIn("keep/.venv", result.stdout)
+
+    def test_sanitization_dry_run_performs_no_mutations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            venv = root / ".venv"
+            venv.mkdir()
+            (venv / "payload").write_text("x")
+
+            result = self.run_script(root, "--sanitize-for", "linux-amd64", "--dry-run")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(venv.exists())
+            self.assertIn("DRY RUN: nothing was modified.", result.stdout)
+
+    def test_sanitization_interactive_yes_no_skip_quit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ["a.pyc", "b.pyc", "c.pyc", "d.pyc"]:
+                (root / name).write_bytes(b"x")
+
+            result = self.run_script(
+                root,
+                "--sanitize-for",
+                "linux-amd64",
+                "--interactive",
+                input_text="y\nn\ns\nq\n",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Declined:            1", result.stdout)
+            self.assertIn("Skipped:             1", result.stdout)
+            self.assertIn("Stopped early:       yes", result.stdout)
+
+    def test_sanitization_deletion_failures_are_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing = root / "missing.pyc"
+            item = codecleaner.SanitizationItem(
+                decision="cache",
+                label="Python bytecode files",
+                path=missing,
+                size=1,
+                kind="file",
+                rule='removable suffix ".pyc"',
+                reason="cache",
+                target=codecleaner.PlatformId("linux", "amd64"),
+            )
+
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                summary = codecleaner.execute_sanitization_cleanup(
+                    root=root,
+                    items=[item],
+                    interactive=False,
+                    dry_run=False,
+                )
+
+            self.assertEqual(summary.errors, 1)
+
+    def test_sanitization_directory_candidate_subsumes_descendants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / ".venv" / "__pycache__"
+            nested.mkdir(parents=True)
+            (nested / "module.pyc").write_bytes(b"x")
+            (root / ".venv" / "native").write_bytes(macho_thin("arm64"))
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+
+            self.assertEqual(len(stats.sanitization_items), 1)
+            self.assertEqual(stats.sanitization_items[0].path, root / ".venv")
+
+    def test_sanitization_plan_materialized_before_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / ".venv"
+            second = root / "node_modules"
+            first.mkdir()
+            second.mkdir()
+            (first / "payload").write_bytes(b"x" * 8192)
+            (second / "payload").write_bytes(b"x")
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+            items = codecleaner.collect_sanitization_items(stats)
+
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                summary = codecleaner.execute_sanitization_cleanup(
+                    root=root,
+                    items=items,
+                    interactive=False,
+                    dry_run=False,
+                )
+
+            self.assertEqual(summary.candidates, 2)
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+
+    def test_sanitization_cross_target_independent_of_host_architecture(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "linux-tool").write_bytes(elf_file("amd64"))
+
+            with patch.object(codecleaner, "detect_native_platform", return_value=codecleaner.PlatformId("macos", "arm64")):
+                result = self.run_script(root, "--sanitize-for", "linux-amd64", "--dry-run")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("COMPATIBLE NATIVE", result.stdout)
+            self.assertIn("Total removable:          0.0 B", result.stdout)
+
+    def test_sanitization_native_cli_resolves_linux_amd64(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = os.environ.copy()
+            with patch.object(codecleaner.platform, "system", return_value="Linux"):
+                with patch.object(codecleaner.platform, "machine", return_value="x86_64"):
+                    native = codecleaner.detect_native_platform()
+
+            self.assertEqual(str(native), "linux-amd64")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), str(root), "--sanitize-for", "native", "--dry-run"],
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Target source:       native", result.stdout)
+
+    def test_sanitization_unknown_formats_default_to_retain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unknown = root / "blob.bin"
+            unknown.write_bytes(b"\x00\x01\x02\x03" * 10)
+
+            result = self.run_script(root, "--sanitize-for", "linux-amd64")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(unknown.exists())
+            self.assertIn("Candidates:          0", result.stdout)
+
+    def test_sanitization_explain_all_lists_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".venv").mkdir()
+            (root / ".venv" / "payload").write_text("x")
+            (root / "tool").write_bytes(macho_thin("arm64"))
+
+            result = self.run_script(
+                root,
+                "--sanitize-for",
+                "linux-amd64",
+                "--dry-run",
+                "--explain-sanitization",
+                "--all",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("SANITIZATION ITEMS", result.stdout)
+            self.assertIn(".venv", result.stdout)
+            self.assertIn("tool", result.stdout)
 
 
 if __name__ == "__main__":

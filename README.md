@@ -8,12 +8,13 @@
 
 # codecleaner
 
-Version: `0.1.0`
+Version: `0.2.0`
 
 `codecleaner` is a conservative cleanup tool for development directories. It
 removes reproducible dependencies, caches, build artifacts, Python bytecode,
 and macOS Mach-O binaries while preserving Git metadata and configured
-preserved trees.
+preserved trees. It can also sanitize a tree for a target operating system and
+CPU architecture before or after migration.
 
 ## Usage
 
@@ -111,6 +112,53 @@ Safely rehearse interactive reclaimable cleanup:
 
 ```bash
 codecleaner ~/code --clean-reclaimable --interactive --dry-run
+```
+
+## Target-Platform Sanitization
+
+Prepare a tree for a different platform before migration:
+
+```bash
+codecleaner ~/code \
+  --sanitize-for linux-amd64 \
+  --dry-run
+```
+
+Sanitize a copied tree for the machine running CodeCleaner:
+
+```bash
+codecleaner ~/code \
+  --sanitize-for native \
+  --dry-run
+```
+
+`native` resolves to the current host platform, such as `linux-amd64` or
+`macos-arm64`. Use `--sanitize` as a shortcut for `--sanitize-for native`.
+
+Supported initial targets:
+
+```text
+linux-amd64
+linux-arm64
+macos-amd64
+macos-arm64
+native
+```
+
+Explain the exact sanitization items:
+
+```bash
+codecleaner ~/code \
+  --sanitize-for linux-amd64 \
+  --explain-sanitization
+```
+
+Walk through sanitization candidates interactively:
+
+```bash
+codecleaner ~/code \
+  --sanitize-for linux-amd64 \
+  --interactive
 ```
 
 Largest repository/directory census:
