@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+<<<<<<< Updated upstream
+=======
+
+### Added
+
+- Detection for Windows PE binaries and common BSD ELF OSABI variants.
+- Sanitization targets for Windows, FreeBSD, OpenBSD, and NetBSD on amd64 and
+  arm64.
+
+## [0.2.0] - 2026-08-08
+>>>>>>> Stashed changes
 
 ### Added
 

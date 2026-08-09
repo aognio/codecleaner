@@ -89,10 +89,18 @@ SANITIZATION_EXPLAIN_LIMIT = 50
 
 
 SUPPORTED_TARGETS = {
+    "freebsd-amd64",
+    "freebsd-arm64",
     "linux-amd64",
     "linux-arm64",
     "macos-amd64",
     "macos-arm64",
+    "netbsd-amd64",
+    "netbsd-arm64",
+    "openbsd-amd64",
+    "openbsd-arm64",
+    "windows-amd64",
+    "windows-arm64",
 }
 
 
@@ -102,6 +110,12 @@ OS_ALIASES = {
     "macos": "macos",
     "osx": "macos",
     "linux": "linux",
+    "freebsd": "freebsd",
+    "openbsd": "openbsd",
+    "netbsd": "netbsd",
+    "windows": "windows",
+    "win": "windows",
+    "win32": "windows",
 }
 
 
@@ -404,7 +418,8 @@ def parse_args() -> argparse.Namespace:
         metavar="TARGET",
         help=(
             "Sanitize the tree for TARGET platform. Supported targets include "
-            "linux-amd64, linux-arm64, macos-amd64, macos-arm64, and native."
+            "linux-amd64, macos-arm64, windows-amd64, freebsd-amd64, "
+            "and native."
         ),
     )
 
@@ -1024,23 +1039,69 @@ def elf_arch_name(machine: int) -> str | None:
     return None
 
 
+def elf_os_name(osabi: int) -> str:
+    if osabi == 2:
+        return "netbsd"
+
+    if osabi == 3:
+        return "linux"
+
+    if osabi == 9:
+        return "freebsd"
+
+    if osabi == 12:
+        return "openbsd"
+
+    # Most Linux ELF files use the generic System V ABI value.
+    return "linux"
+
+
 def parse_elf_artifact(path: Path, data: bytes) -> NativeArtifact | None:
     if len(data) < 20 or data[:4] != b"\x7fELF":
         return None
 
     data_encoding = data[5]
+    os_name = elf_os_name(data[7])
 
     if data_encoding == 1:
         endian = "<"
     elif data_encoding == 2:
         endian = ">"
     else:
-        return NativeArtifact(path, "ELF", "linux", frozenset())
+        return NativeArtifact(path, "ELF", os_name, frozenset())
 
     machine = struct.unpack_from(f"{endian}H", data, 18)[0]
     architecture = elf_arch_name(machine)
     architectures = frozenset([architecture]) if architecture else frozenset()
-    return NativeArtifact(path, "ELF", "linux", architectures)
+    return NativeArtifact(path, "ELF", os_name, architectures)
+
+
+def pe_arch_name(machine: int) -> str | None:
+    if machine == 0x8664:
+        return "amd64"
+
+    if machine == 0xAA64:
+        return "arm64"
+
+    return None
+
+
+def parse_pe_artifact(path: Path, data: bytes) -> NativeArtifact | None:
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return None
+
+    pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+
+    if pe_offset < 0 or len(data) < pe_offset + 6:
+        return None
+
+    if data[pe_offset:pe_offset + 4] != b"PE\x00\x00":
+        return None
+
+    machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
+    architecture = pe_arch_name(machine)
+    architectures = frozenset([architecture]) if architecture else frozenset()
+    return NativeArtifact(path, "PE", "windows", architectures)
 
 
 def inspect_native_artifact(path: Path) -> NativeArtifact | None:
@@ -1068,6 +1129,9 @@ def inspect_native_artifact(path: Path) -> NativeArtifact | None:
 
     if data[:4] == b"\x7fELF":
         return parse_elf_artifact(path, data)
+
+    if data[:2] == b"MZ":
+        return parse_pe_artifact(path, data)
 
     return None
 

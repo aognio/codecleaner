@@ -138,10 +138,18 @@ codecleaner ~/code \
 Supported initial targets:
 
 ```text
+freebsd-amd64
+freebsd-arm64
 linux-amd64
 linux-arm64
 macos-amd64
 macos-arm64
+netbsd-amd64
+netbsd-arm64
+openbsd-amd64
+openbsd-arm64
+windows-amd64
+windows-arm64
 native
 ```
 

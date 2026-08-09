@@ -43,7 +43,7 @@ def macho_fat(*architectures: str) -> bytes:
     return bytes(data)
 
 
-def elf_file(arch: str) -> bytes:
+def elf_file(arch: str, osabi: int = 0) -> bytes:
     machine = {
         "amd64": 62,
         "arm64": 183,
@@ -52,8 +52,24 @@ def elf_file(arch: str) -> bytes:
     data.extend(b"\x02")  # 64-bit
     data.extend(b"\x01")  # little endian
     data.extend(b"\x01")
-    data.extend(b"\x00" * 9)
+    data.extend(bytes([osabi]))
+    data.extend(b"\x00" * 8)
     data.extend((2).to_bytes(2, "little"))
+    data.extend(machine.to_bytes(2, "little"))
+    data.extend(b"\x00" * 64)
+    return bytes(data)
+
+
+def pe_file(arch: str) -> bytes:
+    machine = {
+        "amd64": 0x8664,
+        "arm64": 0xAA64,
+    }[arch]
+    data = bytearray(b"MZ")
+    data.extend(b"\x00" * (0x3C - len(data)))
+    data.extend((0x80).to_bytes(4, "little"))
+    data.extend(b"\x00" * (0x80 - len(data)))
+    data.extend(b"PE\x00\x00")
     data.extend(machine.to_bytes(2, "little"))
     data.extend(b"\x00" * 64)
     return bytes(data)
@@ -1113,6 +1129,56 @@ class CodeCleanerExtendedStatsTests(unittest.TestCase):
             self.assertIsNotNone(artifact)
             self.assertEqual(artifact.architectures, frozenset({"arm64"}))
 
+    def test_sanitization_freebsd_elf_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool"
+            path.write_bytes(elf_file("amd64", osabi=9))
+            artifact = codecleaner.inspect_native_artifact(path)
+
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact.format, "ELF")
+            self.assertEqual(artifact.os, "freebsd")
+            self.assertEqual(artifact.architectures, frozenset({"amd64"}))
+
+    def test_sanitization_openbsd_elf_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool"
+            path.write_bytes(elf_file("arm64", osabi=12))
+            artifact = codecleaner.inspect_native_artifact(path)
+
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact.os, "openbsd")
+            self.assertEqual(artifact.architectures, frozenset({"arm64"}))
+
+    def test_sanitization_netbsd_elf_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool"
+            path.write_bytes(elf_file("amd64", osabi=2))
+            artifact = codecleaner.inspect_native_artifact(path)
+
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact.os, "netbsd")
+
+    def test_sanitization_windows_pe_amd64_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool.exe"
+            path.write_bytes(pe_file("amd64"))
+            artifact = codecleaner.inspect_native_artifact(path)
+
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact.format, "PE")
+            self.assertEqual(artifact.os, "windows")
+            self.assertEqual(artifact.architectures, frozenset({"amd64"}))
+
+    def test_sanitization_windows_pe_arm64_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tool.exe"
+            path.write_bytes(pe_file("arm64"))
+            artifact = codecleaner.inspect_native_artifact(path)
+
+            self.assertIsNotNone(artifact)
+            self.assertEqual(artifact.architectures, frozenset({"arm64"}))
+
     def test_sanitization_macho_rejected_for_linux_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1169,6 +1235,62 @@ class CodeCleanerExtendedStatsTests(unittest.TestCase):
 
             self.assertEqual(len(stats.sanitization_items), 1)
             self.assertEqual(stats.sanitization_items[0].label, "ELF arm64")
+
+    def test_sanitization_windows_pe_retained_for_windows_amd64(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tool.exe").write_bytes(pe_file("amd64"))
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("windows", "amd64"),
+            )
+
+            self.assertEqual(stats.sanitization_items, [])
+            self.assertIn("PE amd64", stats.compatible_native)
+
+    def test_sanitization_windows_pe_rejected_for_linux_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tool.exe").write_bytes(pe_file("amd64"))
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+
+            self.assertEqual(len(stats.sanitization_items), 1)
+            self.assertEqual(stats.sanitization_items[0].decision, "incompatible")
+
+    def test_sanitization_freebsd_elf_retained_for_freebsd_amd64(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tool").write_bytes(elf_file("amd64", osabi=9))
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("freebsd", "amd64"),
+            )
+
+            self.assertEqual(stats.sanitization_items, [])
+            self.assertIn("ELF amd64", stats.compatible_native)
+
+    def test_sanitization_freebsd_elf_rejected_for_linux_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tool").write_bytes(elf_file("amd64", osabi=9))
+            stats = codecleaner.collect_extended_stats(
+                root,
+                [],
+                [],
+                sanitization_target=codecleaner.PlatformId("linux", "amd64"),
+            )
+
+            self.assertEqual(len(stats.sanitization_items), 1)
+            self.assertEqual(stats.sanitization_items[0].decision, "incompatible")
 
     def test_sanitization_executable_scripts_are_not_native(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
